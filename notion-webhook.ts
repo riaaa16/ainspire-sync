@@ -58,39 +58,52 @@ export default async function handler(req: any, res: any) {
     fields.email = String(fields.email).toLowerCase().trim()
   }
 
-  // Determine target docId: prefer filloutId, else look up by email
-  let docId = null
-  if (fields.filloutId) {
-    docId = `fillout-${sanitizeId(fields.filloutId)}`
-  } else if (fields.email) {
-    // Query Sanity for doc with this email
-    const groq = `*[_type == \"memberProfile\" && email == \"${fields.email}\"]{_id}[0]`
-    try {
-      const qres = await query(groq)
-      docId = qres?.result?._id || qres?.result?._ref || (qres?.result && qres.result._id) || null
-      if (!docId && qres?.result?._id === undefined) {
-        // some Sanity responses put data in `result` array
-        if (Array.isArray(qres?.result) && qres.result.length) docId = qres.result[0]._id
-      }
-    } catch (err) {
-      console.warn('Notion handler sanity query failed', err)
+  // If there's no filloutId, do not make any changes — skip to avoid duplicates.
+  if (!fields.filloutId) {
+    console.log('No filloutId present — skipping Sanity changes to avoid duplicates')
+    return res.status(200).json({ ok: true, skipped: true, message: 'no filloutId provided; no changes made' })
+  }
+
+  // From here on we have a filloutId and may create or patch deterministically
+  let docId: string | null = null
+  let willCreate = false
+  const esc = (s: any) => String(s || '').replace(/"/g, '\\"')
+  const candidateId = `fillout-${sanitizeId(fields.filloutId)}`
+
+  // Look for an existing document by filloutId or email to avoid duplicates
+  const conds = [`filloutId == "${esc(fields.filloutId)}"`]
+  if (fields.email) conds.push(`email == "${esc(fields.email)}"`)
+  const groq = `*[_type == "memberProfile" && (${conds.join(' || ')})]{_id}[0]`
+  try {
+    const qres = await query(groq)
+    const foundId = qres?.result?._id || (Array.isArray(qres?.result) && qres.result[0]?._id) || null
+    if (foundId) {
+      docId = foundId
+    } else {
+      docId = candidateId
+      willCreate = true
     }
+  } catch (err) {
+    console.warn('Notion handler sanity query failed', err)
+    // If query fails, still prefer creating deterministically when filloutId exists
+    docId = candidateId
+    willCreate = true
   }
 
-  // If still no docId, create one based on email if present
-  if (!docId && fields.email) docId = `member-${sanitizeId(fields.email)}`
-  if (!docId) return res.status(400).json({ ok: false, error: 'Cannot determine target document id' })
-
-  // Ensure the document exists first, then patch its fields
-  const createObj: any = { _id: docId, _type: 'memberProfile' }
-  if (fields.email) createObj.email = fields.email
-
-  const mutation = {
-    mutations: [
-      { createIfNotExists: createObj },
-      { patch: { id: docId, set: fields } }
-    ]
+  // Build mutations: createIfNotExists only when we will create (filloutId present and not found)
+  const mutations: any[] = []
+  if (willCreate && docId) {
+    const createObj: any = { _id: docId, _type: 'memberProfile' }
+    if (fields.email) createObj.email = fields.email
+    if (fields.filloutId) createObj.filloutId = fields.filloutId
+    mutations.push({ createIfNotExists: createObj })
+    // Ensure filloutId is set on create and patch all fields
+    mutations.push({ patch: { id: docId, set: { ...(fields.filloutId ? { filloutId: fields.filloutId } : {}), ...fields } } })
+  } else if (docId) {
+    mutations.push({ patch: { id: docId, set: fields } })
   }
+
+  const mutation = { mutations }
 
   console.log('Sanity mutation:', JSON.stringify(mutation))
 

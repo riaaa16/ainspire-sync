@@ -73,21 +73,37 @@ export default async function handler(req: any, res: any) {
   if (!doc) return res.status(400).json({ ok: false, error: 'No document in webhook payload' })
 
   const filloutId = doc.filloutId || doc.filloutID || doc['Fillout ID'] || doc['filloutId'] || null
-  if (!filloutId) {
-    console.log('No filloutId on doc — ignoring')
-    return res.status(200).json({ ok: true, note: 'no filloutId, nothing to sync' })
+  const email = (doc.email || doc.Email || doc['Email'] || '').toString().toLowerCase() || null
+
+  if (!filloutId && !email) {
+    console.log('No filloutId or email on doc — ignoring')
+    return res.status(200).json({ ok: true, note: 'no identifier (filloutId or email), nothing to sync' })
   }
 
-  // Query Notion database to find page with matching Fillout ID property
+  // Query Notion database to find page with matching Fillout ID property (preferred)
   const queryUrl = `https://api.notion.com/v1/databases/${NOTION_DATABASE_ID}/query`
-  const queryBody = {
-    filter: {
-      property: 'Fillout ID',
-      rich_text: {
-        equals: String(filloutId)
-      }
-    },
-    page_size: 1
+  let queryBody: any
+  if (filloutId) {
+    queryBody = {
+      filter: {
+        property: 'Fillout ID',
+        rich_text: {
+          equals: String(filloutId)
+        }
+      },
+      page_size: 1
+    }
+  } else {
+    // fallback: match by Email property in Notion
+    queryBody = {
+      filter: {
+        property: 'Email',
+        email: {
+          equals: String(email)
+        }
+      },
+      page_size: 1
+    }
   }
 
   let pageId: string | null = null
@@ -109,8 +125,8 @@ export default async function handler(req: any, res: any) {
     if (Array.isArray(qJson.results) && qJson.results.length) {
       pageId = qJson.results[0].id
     } else {
-      console.log('No Notion page found for Fillout ID', filloutId)
-      return res.status(200).json({ ok: true, note: 'no Notion page matched for filloutId' })
+      console.log('No Notion page found for identifier', { filloutId, email })
+      return res.status(200).json({ ok: true, note: 'no Notion page matched for identifier', identifier: { filloutId, email } })
     }
   } catch (err) {
     console.error('Notion query error', err)

@@ -50,6 +50,22 @@ Webhook setup (what to point at which endpoint)
 	- a simplified `fields` object: `{ "fields": { "email":"...", "firstName":"...", "lastName":"...", "filloutId":"...", ... } }` (recommended), or
 	- Notion's raw `properties` object containing the page's properties. The code maps common names (e.g. `First Name`, `Last Name`, `Email`, `Major`, `Graduation Year`, `LinkedIn`, `Github`, `Personal Website`, `Calendly`, `Career Goal`, `Fillout ID`).
 - **Sanity:** Sanity does not need to send webhooks back into this project by default. `sanity.ts` is a helper client used by the handlers to write data into your Sanity dataset. If you do want Sanity to notify this service of dataset changes, configure a Sanity webhook to POST to one of your endpoints — but there is no built-in `/api/sanity` handler in this repo. If you need a Sanity webhook receiver, I can add a small `api/sanity-webhook.ts` that validates and processes Sanity webhook payloads.
+- **Sanity:** This repo already includes `api/sanity-webhook.ts`. When configured as a Sanity webhook, it will receive `create` and `update` events for `memberProfile` documents and patch the matching Notion page by `filloutId`.
+
+	To enable Sanity → Notion sync:
+	- Set `NOTION_TOKEN` and `NOTION_DATABASE_ID` in your Vercel project environment variables.
+	- Invite the Notion integration (the app tied to `NOTION_TOKEN`) to the Notion database (Share → Invite) so the integration can query and update pages.
+	- Create a Sanity webhook (Project → API → Webhooks) that POSTs to `https://<your-deployment>/api/sanity-webhook` and triggers on `create` and `update` for the `memberProfile` type.
+
+	Quick curl test example (replace domain and IDs):
+
+	```bash
+	curl -X POST "https://ainspire-sync.vercel.app/api/sanity-webhook" \
+		-H "Content-Type: application/json" \
+		-d '{"documents":[{"_id":"memberProfile-123","_type":"memberProfile","filloutId":"4b9a82e5-562e-442e-b877-7ad76e418258","firstName":"Jane","lastName":"Doe","email":"jane.doe@example.com"}]}'
+	```
+
+	The handler will look for `filloutId` on the incoming Sanity document, query your Notion DB for a row where the `Fillout ID` rich_text equals that value, and PATCH the Notion page properties with mapped fields from the Sanity document.
 
 Deployment to Vercel
 1. Login and link the project (one-time):
@@ -83,6 +99,93 @@ Notes and recommendations
 Troubleshooting
 - If you get authentication or permission errors from Sanity, verify that `SANITY_SERVICE_TOKEN` has write access to the specified dataset.
 - If `vercel dev` fails to start, try updating the Vercel CLI or running `npx vercel dev` instead.
+
+Webhooks & Two-way sync
+--------------------------------
+Which endpoints to point each system at
+- **Fillout (form provider)**: point Fillout webhook to `https://<your-deployment>/api/fillout` (e.g. `https://ainspire-sync.vercel.app/api/fillout`). Fillout should POST a JSON body including `submission_id` (or `id`) and form fields. The handler maps fields into Sanity.
+- **Notion (database automation)**: point Notion automation to `https://<your-deployment>/api/notion-webhook` (e.g. `https://ainspire-sync.vercel.app/api/notion-webhook`). The integration accepts either a simplified `fields` object or Notion's raw `properties` object. The handler maps common column names (including `Fillout ID`, `First Name`, `Last Name`, `Email`, etc.).
+- **Sanity -> Notion (optional two-way sync)**: this repo includes `api/sanity-webhook` which accepts Sanity webhook payloads and patches the matching Notion page using `Fillout ID` (the Sanity document must have `filloutId` populated). Use the Sanity dashboard to create a webhook that calls `https://<your-deployment>/api/sanity-webhook` on `create` and `update` for `memberProfile`.
+
+Environment variables (summary)
+- `SANITY_PROJECT_ID` — (required) your Sanity project id
+- `SANITY_DATASET` — (optional) defaults to `production`
+- `SANITY_SERVICE_TOKEN` — (required) service token with write access
+- `NOTION_TOKEN` — (required for Sanity->Notion) Notion integration token with DB access
+- `NOTION_DATABASE_ID` — (required for Sanity->Notion) Notion database id containing your rows (see "Find Notion DB ID")
+- `NOTION_VERSION` — optional Notion API version (defaults to `2022-06-28`)
+
+Find Notion Database ID
+- Open the Notion database page in your browser (the full database view). The long hex id in the URL path is the database id. Example:
+
+```
+https://www.notion.so/workspace/2c51c816107d805ab1c8ebf8124137a4?v=... 
+```
+
+The database id is `2c51c816107d805ab1c8ebf8124137a4` (you can also use the dashed UUID form `2c51c816-107d-805a-b1c8-ebf8124137a4`).
+
+PowerShell quick checks (recommended on Windows)
+- Set env vars for this session:
+```
+$env:NOTION_TOKEN = "<your_notion_token>"
+$env:NOTION_DATABASE_ID = "<your_db_id>"
+$env:NOTION_VERSION = "2022-06-28"
+```
+- Get DB metadata:
+```powershell
+Invoke-RestMethod -Uri "https://api.notion.com/v1/databases/$($env:NOTION_DATABASE_ID)" -Method Get -Headers @{ "Authorization" = "Bearer $env:NOTION_TOKEN"; "Notion-Version" = $env:NOTION_VERSION }
+```
+- Query by Fillout ID (replace `$filloutId`):
+```powershell
+$filloutId = "4b9a82e5-562e-442e-b877-7ad76e418258"
+$body = @{ filter = @{ property = "Fillout ID"; rich_text = @{ equals = $filloutId } }; page_size = 1 } | ConvertTo-Json -Depth 6
+Invoke-RestMethod -Uri "https://api.notion.com/v1/databases/$($env:NOTION_DATABASE_ID)/query" -Method Post -Headers @{ "Authorization" = "Bearer $env:NOTION_TOKEN"; "Notion-Version" = $env:NOTION_VERSION; "Content-Type" = "application/json" } -Body $body
+```
+
+Bash / curl quick checks (use `--ssl-no-revoke` on Windows if curl schannel errors occur)
+- Load local `.env` into your shell:
+```bash
+set -a
+. .env
+set +a
+```
+- DB metadata check:
+```bash
+curl -sS -H "Authorization: Bearer $NOTION_TOKEN" -H "Notion-Version: ${NOTION_VERSION:-2022-06-28}" "https://api.notion.com/v1/databases/$NOTION_DATABASE_ID" | jq '.'
+```
+- Query DB for Fillout ID:
+```bash
+FILLOUT_ID="4b9a82e5-562e-442e-b877-7ad76e418258"
+cat <<'JSON' > /tmp/notion_query.json
+{
+	"filter": { "property": "Fillout ID", "rich_text": { "equals": "'"${FILLOUT_ID}"'" } },
+	"page_size": 1
+}
+JSON
+
+curl -sS -H "Authorization: Bearer $NOTION_TOKEN" -H "Notion-Version: ${NOTION_VERSION:-2022-06-28}" -H "Content-Type: application/json" -d @/tmp/notion_query.json "https://api.notion.com/v1/databases/$NOTION_DATABASE_ID/query" | jq '.'
+```
+
+Local testing & ngrok
+- Start local dev: `npx vercel dev` (functions available at `http://localhost:3000/api/*`).
+- Send test payloads with curl or PowerShell (examples earlier in this README).
+- To let Notion call your local server, run `ngrok http 3000` and point Notion webhook to the `https://<ngrok>.ngrok.io/api/notion-webhook` URL.
+
+Sanity webhook (Sanity -> Notion)
+- This repo provides `api/sanity-webhook` which:
+	- Accepts Sanity webhook payloads, finds `filloutId` on the Sanity document,
+	- Queries your Notion database for a page where `Fillout ID` equals that value,
+	- Patches the Notion page properties with mapped fields from Sanity.
+- Configure the Sanity webhook in Sanity Cloud (Project → API → Webhooks) to POST to `https://<your-deployment>/api/sanity-webhook` on `create` and `update` for `memberProfile` documents.
+
+Security & best practices
+- Do NOT commit `.env` or secrets. Use Vercel Environment Variables for production.
+- Add a shared-secret header to external webhooks (Fillout / Notion / Sanity) and verify it in the handlers.
+- Invite the Notion integration (the app tied to `NOTION_TOKEN`) to the Notion database via Share → Add connection so the token can query/update pages.
+- Consider adding retry/backoff and idempotency for Notion calls (rate limits, network errors).
+
+Want help with any of these?
+- I can add a small `scripts/notion-check.sh` or a Node test script that posts your saved `OUTPUT.json` to `api/notion-webhook` or `api/sanity-webhook` (avoids Windows curl TLS issues).  Tell me which you prefer and I will add it.
 
 Want me to:
 - add example curl payloads for quick testing, or
