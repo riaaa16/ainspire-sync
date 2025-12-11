@@ -26,17 +26,20 @@ function mapNotionProperties(props) {
         return null;
     };
     return {
-        filloutId: getText(props.FilloutId) || getText(props.filloutId) || null,
-        firstName: getText(props.First) || getText(props.first) || null,
-        lastName: getText(props.Last) || getText(props.last) || null,
-        email: getText(props.Email) || getText(props.email) || null,
+        filloutId: getText(props.FilloutId) || getText(props['Fillout ID']) || getText(props.filloutId) || null,
+        firstName: getText(props['First Name']) || getText(props.First) || getText(props.first) || null,
+        lastName: getText(props['Last Name']) || getText(props.Last) || getText(props.last) || null,
+        email: getText(props.Email) || getText(props['Email']) || getText(props.email) || null,
         major: getText(props.Major) || null,
-        graduationYear: getText(props['Graduation Year']) || null,
-        linkedin: getText(props.LinkedIn) || null,
-        github: getText(props.GitHub) || null,
-        personalWebsite: getText(props.Website) || null,
-        calendly: getText(props.Calendly) || null,
-        careerGoal: getText(props['Career Goal']) || null,
+        graduationYear: (() => {
+            const v = getText(props['Graduation Year']) || getText(props.graduationYear);
+            return v ? Number(v) : null;
+        })(),
+        linkedin: getText(props.LinkedIn) || getText(props['LinkedIn']) || null,
+        github: getText(props.GitHub) || getText(props.Github) || getText(props.github) || null,
+        personalWebsite: getText(props['Personal Website']) || getText(props.Website) || null,
+        calendly: getText(props.Calendly) || getText(props['Calendly']) || null,
+        careerGoal: getText(props['Career Goal']) || getText(props['CareerGoal']) || null,
     };
 }
 async function handler(req, res) {
@@ -74,9 +77,12 @@ async function handler(req, res) {
     if (!docId)
         return res.status(400).json({ ok: false, error: 'Cannot determine target document id' });
     // Ensure the document exists first, then patch its fields
+    const createObj = { _id: docId, _type: 'memberProfile' };
+    if (fields.email)
+        createObj.email = fields.email;
     const mutation = {
         mutations: [
-            { createIfNotExists: { _id: docId, _type: 'memberProfile', email: fields.email } },
+            { createIfNotExists: createObj },
             { patch: { id: docId, set: fields } }
         ]
     };
@@ -86,8 +92,19 @@ async function handler(req, res) {
         return res.status(200).json({ ok: true, result });
     }
     catch (err) {
-        console.error('Notion handler error', err);
+        // Log full error details for Vercel logs
+        const details = err?.body ?? err?.message ?? String(err);
+        console.error('Notion handler error', { err, details });
         const status = err?.status || 500;
-        return res.status(status).json({ ok: false, error: err?.body || err?.message || String(err) });
+        const messages = [];
+        if (err?.body?.message)
+            messages.push(String(err.body.message));
+        else if (err?.body && typeof err.body === 'string')
+            messages.push(err.body);
+        else if (err?.message)
+            messages.push(String(err.message));
+        else
+            messages.push(String(err));
+        return res.status(status).json({ ok: false, error: details, messages });
     }
 }
