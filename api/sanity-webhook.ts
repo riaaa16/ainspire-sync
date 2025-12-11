@@ -1,3 +1,5 @@
+import { query as sanityQuery } from '../sanity'
+
 const NOTION_TOKEN = process.env.NOTION_TOKEN || ''
 const NOTION_DATABASE_ID = process.env.NOTION_DATABASE_ID || ''
 const NOTION_VERSION = process.env.NOTION_VERSION || '2022-06-28'
@@ -72,19 +74,58 @@ export default async function handler(req: any, res: any) {
   const doc = sanityDocFromPayload(body)
   if (!doc) return res.status(400).json({ ok: false, error: 'No document in webhook payload' })
 
-  // Detect deletion events from Sanity payload shapes.
-  // Common shapes: body.document may be missing for deletes; body.documentId or body.ids may be present.
-  const isDeleteEvent = Boolean(
-    body.action === 'delete' || body.event === 'delete' || body.delete === true ||
-    (doc && (doc._deleted === true)) || body.documentId || (Array.isArray(body.ids) && body.ids.length)
+  // Read Sanity-provided header (preferred) and detect delete events robustly.
+  // Header `sanity-operation` is either: create | update | delete
+  const headerOp = (req.headers && (req.headers['sanity-operation'] || req.headers['Sanity-Operation'])) || ''
+  const sanityOp = String(headerOp || '').toLowerCase()
+
+  const explicitDelete = sanityOp === 'delete'
+  const docMarkedDeleted = Boolean(doc && (doc._deleted === true))
+  // ids-only delete: body contains documentId or ids but no full document payload
+  const idsOnlyDelete = Boolean(
+    (body.documentId || (Array.isArray(body.ids) && body.ids.length)) &&
+    !body.document
   )
 
-  const filloutId = doc?.filloutId || doc?.filloutID || doc?.['Fillout ID'] || doc?.['filloutId'] || null
-  const email = (doc?.email || doc?.Email || doc?.['Email'] || '').toString().toLowerCase() || null
+  const isDeleteEvent = explicitDelete || docMarkedDeleted || idsOnlyDelete
 
-  if (!filloutId && !email && !isDeleteEvent) {
-    console.log('No filloutId or email on doc — ignoring')
-    return res.status(200).json({ ok: true, note: 'no identifier (filloutId or email), nothing to sync' })
+  // Determine identifiers: prefer doc.filloutId, otherwise fallback to attempting to derive
+  // the UUID part from documentId (e.g. 'fillout-<uuid>' or 'drafts.fillout-<uuid>')
+  let filloutId = doc?.filloutId || doc?.filloutID || doc?.['Fillout ID'] || doc?.['filloutId'] || null
+  let email = (doc?.email || doc?.Email || doc?.['Email'] || '')?.toString()?.toLowerCase() || null
+
+  // If no filloutId and Sanity sent only ids (ids-only delete), try to fetch the doc
+  // from Sanity to obtain the canonical `filloutId` (preferred) before acting.
+  if (!filloutId && (body.documentId || (Array.isArray(body.ids) && body.ids.length))) {
+    const candidate = String(body.documentId || (Array.isArray(body.ids) && body.ids[0]) || '')
+    const normalized = candidate.replace(/^drafts\./i, '')
+
+    // If the doc id already encodes the fillout id (fillout-<uuid>), derive it.
+    if (normalized.startsWith('fillout-')) {
+      filloutId = normalized.slice('fillout-'.length)
+    } else {
+      // Otherwise attempt to fetch the Sanity doc by _id to read its filloutId/email
+      try {
+        const groq = `*[_id == "${candidate}" || _id == "drafts.${candidate}"][0]{filloutId, email}`
+        const qRes = await sanityQuery(groq)
+        if (qRes && qRes.result) {
+          const found = qRes.result
+          if (found?.filloutId) filloutId = found.filloutId
+          if (!email && found?.email) email = String(found.email).toLowerCase()
+        }
+      } catch (err) {
+        console.warn('Failed to fetch Sanity doc to derive filloutId', err)
+      }
+    }
+  }
+
+  console.log('Sanity webhook header/op:', { sanityOp, explicitDelete, docMarkedDeleted, idsOnlyDelete, filloutId, email })
+
+  // For non-delete events we require a filloutId to proceed — this avoids accidental
+  // creation/duplication in Sanity/Notion when only an email is present.
+  if (!filloutId && !isDeleteEvent) {
+    console.log('No filloutId on non-delete event — skipping to avoid duplicates')
+    return res.status(200).json({ ok: true, note: 'no filloutId on non-delete event; skipping' })
   }
 
   // Handle delete events: archive/delete the Notion page when a Sanity doc is deleted
@@ -179,7 +220,12 @@ export default async function handler(req: any, res: any) {
       },
       page_size: 1
     }
-  } 
+  } else {
+    // If we don't have a filloutId at this point (shouldn't happen for non-delete),
+    // bail out to avoid matching by email during updates.
+    console.log('No filloutId available for update — skipping Notion update')
+    return res.status(200).json({ ok: true, note: 'no filloutId; skipped update' })
+  }
 
   let pageId: string | null = null
   try {

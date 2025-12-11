@@ -1,0 +1,284 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.default = handler;
+const sanity_1 = require("../sanity");
+const NOTION_TOKEN = process.env.NOTION_TOKEN || '';
+const NOTION_DATABASE_ID = process.env.NOTION_DATABASE_ID || '';
+const NOTION_VERSION = process.env.NOTION_VERSION || '2022-06-28';
+function sanityDocFromPayload(body) {
+    if (!body)
+        return null;
+    return (body.document ||
+        (Array.isArray(body.documents) && body.documents[0]) ||
+        (Array.isArray(body.result) && body.result[0]) ||
+        body);
+}
+function mapSanityToNotionProps(doc) {
+    const props = {};
+    const setTitle = (name, value) => {
+        if (!value && value !== 0)
+            return;
+        props[name] = { title: [{ text: { content: String(value) } }] };
+    };
+    const setRich = (name, value) => {
+        if (!value && value !== 0)
+            return;
+        props[name] = { rich_text: [{ text: { content: String(value) } }] };
+    };
+    const setUrl = (name, value) => {
+        if (!value)
+            return;
+        props[name] = { url: String(value) };
+    };
+    const setEmail = (name, value) => {
+        if (!value)
+            return;
+        props[name] = { email: String(value) };
+    };
+    const setNumber = (name, value) => {
+        if (value === undefined || value === null)
+            return;
+        const n = Number(value);
+        if (Number.isNaN(n))
+            return;
+        props[name] = { number: n };
+    };
+    // Map fields (adjust names to match your Notion DB column names)
+    // Use Fillout ID only for lookup — we don't overwrite it here
+    setTitle('First Name', doc.firstName || doc['firstName'] || doc['First Name']);
+    setRich('Last Name', doc.lastName || doc['lastName'] || doc['Last Name']);
+    setEmail('Email', doc.email || doc['email']);
+    setRich('Major', doc.major || doc['major']);
+    setNumber('Graduation Year', doc.graduationYear || doc['graduationYear']);
+    setUrl('LinkedIn', doc.linkedin || doc['linkedin']);
+    setUrl('Github', doc.github || doc['github']);
+    setUrl('Personal Website', doc.personalWebsite || doc['personalWebsite']);
+    setUrl('Calendly', doc.calendly || doc['calendly']);
+    setRich('Career Goal', doc.careerGoal || doc['careerGoal']);
+    return props;
+}
+async function handler(req, res) {
+    if (req.method !== 'POST')
+        return res.status(405).json({ ok: false, error: 'Method not allowed' });
+    if (!NOTION_TOKEN || !NOTION_DATABASE_ID) {
+        console.error('Missing NOTION_TOKEN or NOTION_DATABASE_ID env vars');
+        return res.status(500).json({ ok: false, error: 'Notion credentials not configured' });
+    }
+    const body = req.body || {};
+    try {
+        console.log('Sanity webhook payload:', JSON.stringify(body));
+    }
+    catch (e) {
+        console.log('Sanity webhook payload (non-json)');
+    }
+    const doc = sanityDocFromPayload(body);
+    if (!doc)
+        return res.status(400).json({ ok: false, error: 'No document in webhook payload' });
+    // Read Sanity-provided header (preferred) and detect delete events robustly.
+    // Header `sanity-operation` is either: create | update | delete
+    const headerOp = (req.headers && (req.headers['sanity-operation'] || req.headers['Sanity-Operation'])) || '';
+    const sanityOp = String(headerOp || '').toLowerCase();
+    const explicitDelete = sanityOp === 'delete';
+    const docMarkedDeleted = Boolean(doc && (doc._deleted === true));
+    // ids-only delete: body contains documentId or ids but no full document payload
+    const idsOnlyDelete = Boolean((body.documentId || (Array.isArray(body.ids) && body.ids.length)) &&
+        !body.document);
+    const isDeleteEvent = explicitDelete || docMarkedDeleted || idsOnlyDelete;
+    // Determine identifiers: prefer doc.filloutId, otherwise fallback to attempting to derive
+    // the UUID part from documentId (e.g. 'fillout-<uuid>' or 'drafts.fillout-<uuid>')
+    let filloutId = doc?.filloutId || doc?.filloutID || doc?.['Fillout ID'] || doc?.['filloutId'] || null;
+    let email = (doc?.email || doc?.Email || doc?.['Email'] || '')?.toString()?.toLowerCase() || null;
+    // If no filloutId and Sanity sent only ids (ids-only delete), try to fetch the doc
+    // from Sanity to obtain the canonical `filloutId` (preferred) before acting.
+    if (!filloutId && (body.documentId || (Array.isArray(body.ids) && body.ids.length))) {
+        const candidate = String(body.documentId || (Array.isArray(body.ids) && body.ids[0]) || '');
+        const normalized = candidate.replace(/^drafts\./i, '');
+        // If the doc id already encodes the fillout id (fillout-<uuid>), derive it.
+        if (normalized.startsWith('fillout-')) {
+            filloutId = normalized.slice('fillout-'.length);
+        }
+        else {
+            // Otherwise attempt to fetch the Sanity doc by _id to read its filloutId/email
+            try {
+                const groq = `*[_id == "${candidate}" || _id == "drafts.${candidate}"][0]{filloutId, email}`;
+                const qRes = await (0, sanity_1.query)(groq);
+                if (qRes && qRes.result) {
+                    const found = qRes.result;
+                    if (found?.filloutId)
+                        filloutId = found.filloutId;
+                    if (!email && found?.email)
+                        email = String(found.email).toLowerCase();
+                }
+            }
+            catch (err) {
+                console.warn('Failed to fetch Sanity doc to derive filloutId', err);
+            }
+        }
+    }
+    console.log('Sanity webhook header/op:', { sanityOp, explicitDelete, docMarkedDeleted, idsOnlyDelete, filloutId, email });
+    // For non-delete events we require a filloutId to proceed — this avoids accidental
+    // creation/duplication in Sanity/Notion when only an email is present.
+    if (!filloutId && !isDeleteEvent) {
+        console.log('No filloutId on non-delete event — skipping to avoid duplicates');
+        return res.status(200).json({ ok: true, note: 'no filloutId on non-delete event; skipping' });
+    }
+    // Handle delete events: archive/delete the Notion page when a Sanity doc is deleted
+    if (isDeleteEvent) {
+        let pageId = null;
+        // Prefer matching by Fillout ID in Notion, fallback to Email property
+        if (filloutId) {
+            const queryUrl = `https://api.notion.com/v1/databases/${NOTION_DATABASE_ID}/query`;
+            const queryBody = {
+                filter: { property: 'Fillout ID', rich_text: { equals: String(filloutId) } },
+                page_size: 1
+            };
+            try {
+                const qRes = await fetch(queryUrl, {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${NOTION_TOKEN}`,
+                        'Notion-Version': NOTION_VERSION,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(queryBody)
+                });
+                const qJson = await qRes.json();
+                if (qRes.ok && Array.isArray(qJson.results) && qJson.results.length)
+                    pageId = qJson.results[0].id;
+            }
+            catch (err) {
+                console.error('Notion query error while handling delete', err);
+            }
+        }
+        else if (email) {
+            const queryUrl = `https://api.notion.com/v1/databases/${NOTION_DATABASE_ID}/query`;
+            const queryBody = {
+                filter: { property: 'Email', email: { equals: String(email) } },
+                page_size: 1
+            };
+            try {
+                const qRes = await fetch(queryUrl, {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${NOTION_TOKEN}`,
+                        'Notion-Version': NOTION_VERSION,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(queryBody)
+                });
+                const qJson = await qRes.json();
+                if (qRes.ok && Array.isArray(qJson.results) && qJson.results.length)
+                    pageId = qJson.results[0].id;
+            }
+            catch (err) {
+                console.error('Notion query error while handling delete (email)', err);
+            }
+        }
+        if (!pageId) {
+            console.log('No Notion page id found to delete for', { filloutId, email });
+            return res.status(200).json({ ok: true, note: 'no Notion page found to delete' });
+        }
+        // Archive the Notion page (mark as archived) rather than permanent delete
+        try {
+            const patchUrl = `https://api.notion.com/v1/pages/${pageId}`;
+            const pRes = await fetch(patchUrl, {
+                method: 'PATCH',
+                headers: {
+                    'Authorization': `Bearer ${NOTION_TOKEN}`,
+                    'Notion-Version': NOTION_VERSION,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ archived: true })
+            });
+            const pJson = await pRes.json();
+            if (!pRes.ok) {
+                console.error('Notion archive failed', pRes.status, pJson);
+                return res.status(502).json({ ok: false, error: 'Notion archive failed', detail: pJson });
+            }
+            console.log('Notion page archived', pageId);
+            return res.status(200).json({ ok: true, archived: pageId });
+        }
+        catch (err) {
+            console.error('Notion archive error', err);
+            return res.status(502).json({ ok: false, error: 'Notion archive error', detail: String(err) });
+        }
+    }
+    // Query Notion database to find page with matching Fillout ID property (preferred)
+    const queryUrl = `https://api.notion.com/v1/databases/${NOTION_DATABASE_ID}/query`;
+    let queryBody;
+    if (filloutId) {
+        queryBody = {
+            filter: {
+                property: 'Fillout ID',
+                rich_text: {
+                    equals: String(filloutId)
+                }
+            },
+            page_size: 1
+        };
+    }
+    else {
+        // If we don't have a filloutId at this point (shouldn't happen for non-delete),
+        // bail out to avoid matching by email during updates.
+        console.log('No filloutId available for update — skipping Notion update');
+        return res.status(200).json({ ok: true, note: 'no filloutId; skipped update' });
+    }
+    let pageId = null;
+    try {
+        const qRes = await fetch(queryUrl, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${NOTION_TOKEN}`,
+                'Notion-Version': NOTION_VERSION,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(queryBody)
+        });
+        const qJson = await qRes.json();
+        if (!qRes.ok) {
+            console.error('Notion query failed', qRes.status, qJson);
+            return res.status(502).json({ ok: false, error: 'Notion query failed', detail: qJson });
+        }
+        if (Array.isArray(qJson.results) && qJson.results.length) {
+            pageId = qJson.results[0].id;
+        }
+        else {
+            console.log('No Notion page found for identifier', { filloutId, email });
+            return res.status(200).json({ ok: true, note: 'no Notion page matched for identifier', identifier: { filloutId, email } });
+        }
+    }
+    catch (err) {
+        console.error('Notion query error', err);
+        return res.status(502).json({ ok: false, error: 'Notion query error', detail: String(err) });
+    }
+    // Build Notion properties from Sanity doc
+    const notionProps = mapSanityToNotionProps(doc);
+    if (Object.keys(notionProps).length === 0) {
+        console.log('No updatable fields present on doc; nothing to update on Notion');
+        return res.status(200).json({ ok: true, note: 'no updatable fields' });
+    }
+    // PATCH the page
+    try {
+        const patchUrl = `https://api.notion.com/v1/pages/${pageId}`;
+        const pRes = await fetch(patchUrl, {
+            method: 'PATCH',
+            headers: {
+                'Authorization': `Bearer ${NOTION_TOKEN}`,
+                'Notion-Version': NOTION_VERSION,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ properties: notionProps })
+        });
+        const pJson = await pRes.json();
+        if (!pRes.ok) {
+            console.error('Notion update failed', pRes.status, pJson);
+            return res.status(502).json({ ok: false, error: 'Notion update failed', detail: pJson });
+        }
+        console.log('Notion page updated', pageId);
+        return res.status(200).json({ ok: true, result: pJson });
+    }
+    catch (err) {
+        console.error('Notion update error', err);
+        return res.status(502).json({ ok: false, error: 'Notion update error', detail: String(err) });
+    }
+}
