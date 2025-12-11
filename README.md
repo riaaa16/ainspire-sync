@@ -107,6 +107,11 @@ Which endpoints to point each system at
 - **Notion (database automation)**: point Notion automation to `https://<your-deployment>/api/notion-webhook` (e.g. `https://ainspire-sync.vercel.app/api/notion-webhook`). The integration accepts either a simplified `fields` object or Notion's raw `properties` object. The handler maps common column names (including `Fillout ID`, `First Name`, `Last Name`, `Email`, etc.).
 - **Sanity -> Notion (optional two-way sync)**: this repo includes `api/sanity-webhook` which accepts Sanity webhook payloads and patches the matching Notion page using `Fillout ID` (the Sanity document must have `filloutId` populated). Use the Sanity dashboard to create a webhook that calls `https://<your-deployment>/api/sanity-webhook` on `create` and `update` for `memberProfile`.
 
+Design notes
+-
+- **Create operations**: All creations should be handled by the `fillout` handler. The system expects new member documents to originate from Fillout submissions (the `fillout` endpoint). Notion and Sanity handlers are intended to update or delete existing documents rather than create new ones.
+- **Deletes (two-way)**: Documents may be deleted (or archived) from either Sanity or Notion. The service supports two-way delete propagation: Sanity deletes will archive the matching Notion page (found by `filloutId` or email), and Notion deletions can trigger deletion of the matching Sanity `memberProfile` document (matched by `filloutId` or email).
+
 Environment variables (summary)
 - `SANITY_PROJECT_ID` — (required) your Sanity project id
 - `SANITY_DATASET` — (optional) defaults to `production`
