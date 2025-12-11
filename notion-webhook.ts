@@ -13,6 +13,7 @@ function mapNotionProperties(props: any) {
     if (p.multi_select && p.multi_select.map) return p.multi_select.map((s: any) => s.name).join(', ')
     if (p.email) return p.email
     if (p.url) return p.url
+    if (typeof p === 'number') return String(p)
     return null
   }
 
@@ -40,11 +41,22 @@ function mapNotionProperties(props: any) {
 export default async function handler(req: any, res: any) {
   if (req.method !== 'POST') return res.status(405).send({ error: 'Method not allowed' })
 
-  // Notion webhook payloads vary. We accept either raw Notion webhook body or a
-  // simplified `fields` object mapped by the caller.
   const body = req.body || {}
-  const properties = body.properties || body.fields || {}
+
+  // Debug log: show incoming body shape to Vercel logs (helps diagnose missing fields)
+  try { console.log('Notion incoming body:', JSON.stringify(body)) } catch (e) { console.log('Notion incoming body (non-json)') }
+
+  // Accept multiple payload shapes:
+  // - { properties: { ... } } (simple)
+  // - { fields: { ... } } (simplified)
+  // - { data: { properties: { ... } } } (Notion automation wrapper)
+  const properties = body.properties || body.fields || (body.data && (body.data.properties || body.data.fields)) || {}
   const fields = mapNotionProperties(properties)
+
+  // normalize email for matching
+  if (fields.email) {
+    fields.email = String(fields.email).toLowerCase().trim()
+  }
 
   // Determine target docId: prefer filloutId, else look up by email
   let docId = null
