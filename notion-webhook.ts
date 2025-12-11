@@ -59,12 +59,14 @@ export default async function handler(req: any, res: any) {
   let properties: any = null
 
   // Integration webhook: fetch page properties when Notion sends a page event
+  let integrationPageId: string | null = null
   if (body && body.entity && body.entity.type === 'page' && typeof body.entity.id === 'string') {
     if (!NOTION_TOKEN) {
       console.warn('Received Notion integration webhook but NOTION_TOKEN not set; cannot fetch page')
     } else {
       try {
         const pageId = body.entity.id
+        integrationPageId = pageId
         const pageRes = await fetch(`https://api.notion.com/v1/pages/${pageId}`, {
           headers: {
             Authorization: `Bearer ${NOTION_TOKEN}`,
@@ -81,6 +83,55 @@ export default async function handler(req: any, res: any) {
       } catch (err) {
         console.warn('Error fetching Notion page properties', err)
       }
+    }
+  }
+
+  // If this is a Notion integration deletion event (page deleted/removed), try to delete corresponding Sanity doc
+  const isNotionDeleteEvent = typeof body.type === 'string' && /deleted|removed|archived/i.test(body.type)
+  if (isNotionDeleteEvent && body.entity && body.entity.type === 'page' && body.entity.id) {
+    const pageId = String(body.entity.id)
+
+    // Try to determine Fillout ID or email from the fetched properties (if we had them)
+    let pageFields: any = {}
+    if (properties) {
+      pageFields = mapNotionProperties(properties)
+    }
+
+    const filloutId = pageFields.filloutId || null
+    const email = pageFields.email ? String(pageFields.email).toLowerCase().trim() : null
+
+    // If we don't have any identifier from the page properties, skip deletion to avoid accidental removes
+    if (!filloutId && !email) {
+      console.log('Notion delete event received but no Fillout ID or email available; skipping')
+      return res.status(200).json({ ok: true, skipped: true, message: 'no identifier available to find Sanity doc' })
+    }
+
+    try {
+      // Prefer matching by Fillout ID in Sanity
+      let groq = ''
+      if (filloutId) groq = `*[_type==\"memberProfile\" && filloutId == \"${filloutId}\"]{_id}[0]`
+      else groq = `*[_type==\"memberProfile\" && email == \"${email}\"]{_id}[0]`
+
+      const qres = await query(groq)
+      const sanityId = qres?.result?._id || (Array.isArray(qres?.result) && qres.result[0]?._id) || null
+      if (!sanityId) {
+        console.log('No Sanity doc found for deleted Notion page via identifiers', { filloutId, email })
+        return res.status(200).json({ ok: true, note: 'no matching Sanity doc to delete', identifier: { filloutId, email } })
+      }
+
+      // Delete the Sanity document
+      const mutation = { mutations: [ { delete: { id: sanityId } } ] }
+      try {
+        const result = await mutate(mutation)
+        console.log('Deleted Sanity doc for Notion page', { pageId, sanityId })
+        return res.status(200).json({ ok: true, deleted: sanityId, result })
+      } catch (err) {
+        console.error('Failed to delete Sanity doc for Notion page', err)
+        return res.status(502).json({ ok: false, error: 'Sanity delete failed', detail: String(err) })
+      }
+    } catch (err) {
+      console.warn('Error querying Sanity for identifiers on delete event', err)
+      return res.status(502).json({ ok: false, error: 'Sanity query failed', detail: String(err) })
     }
   }
 
@@ -137,6 +188,8 @@ export default async function handler(req: any, res: any) {
   } else if (docId) {
     mutations.push({ patch: { id: docId, set: fields } })
   }
+
+  // (no notionId stored in Sanity) — do not persist Notion page id into Sanity schema
 
   const mutation = { mutations }
 

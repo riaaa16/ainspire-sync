@@ -72,12 +72,98 @@ export default async function handler(req: any, res: any) {
   const doc = sanityDocFromPayload(body)
   if (!doc) return res.status(400).json({ ok: false, error: 'No document in webhook payload' })
 
-  const filloutId = doc.filloutId || doc.filloutID || doc['Fillout ID'] || doc['filloutId'] || null
-  const email = (doc.email || doc.Email || doc['Email'] || '').toString().toLowerCase() || null
+  // Detect deletion events from Sanity payload shapes.
+  // Common shapes: body.document may be missing for deletes; body.documentId or body.ids may be present.
+  const isDeleteEvent = Boolean(
+    body.action === 'delete' || body.event === 'delete' || body.delete === true ||
+    (doc && (doc._deleted === true)) || body.documentId || (Array.isArray(body.ids) && body.ids.length)
+  )
 
-  if (!filloutId && !email) {
+  const filloutId = doc?.filloutId || doc?.filloutID || doc?.['Fillout ID'] || doc?.['filloutId'] || null
+  const email = (doc?.email || doc?.Email || doc?.['Email'] || '').toString().toLowerCase() || null
+
+  if (!filloutId && !email && !isDeleteEvent) {
     console.log('No filloutId or email on doc — ignoring')
     return res.status(200).json({ ok: true, note: 'no identifier (filloutId or email), nothing to sync' })
+  }
+
+  // Handle delete events: archive/delete the Notion page when a Sanity doc is deleted
+  if (isDeleteEvent) {
+    let pageId: string | null = null
+
+    // Prefer matching by Fillout ID in Notion, fallback to Email property
+    if (filloutId) {
+      const queryUrl = `https://api.notion.com/v1/databases/${NOTION_DATABASE_ID}/query`
+      const queryBody = {
+        filter: { property: 'Fillout ID', rich_text: { equals: String(filloutId) } },
+        page_size: 1
+      }
+      try {
+        const qRes = await fetch(queryUrl, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${NOTION_TOKEN}`,
+            'Notion-Version': NOTION_VERSION,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify(queryBody)
+        })
+        const qJson = await qRes.json()
+        if (qRes.ok && Array.isArray(qJson.results) && qJson.results.length) pageId = qJson.results[0].id
+      } catch (err) {
+        console.error('Notion query error while handling delete', err)
+      }
+    } else if (email) {
+      const queryUrl = `https://api.notion.com/v1/databases/${NOTION_DATABASE_ID}/query`
+      const queryBody = {
+        filter: { property: 'Email', email: { equals: String(email) } },
+        page_size: 1
+      }
+      try {
+        const qRes = await fetch(queryUrl, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${NOTION_TOKEN}`,
+            'Notion-Version': NOTION_VERSION,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify(queryBody)
+        })
+        const qJson = await qRes.json()
+        if (qRes.ok && Array.isArray(qJson.results) && qJson.results.length) pageId = qJson.results[0].id
+      } catch (err) {
+        console.error('Notion query error while handling delete (email)', err)
+      }
+    }
+
+    if (!pageId) {
+      console.log('No Notion page id found to delete for', { filloutId, email })
+      return res.status(200).json({ ok: true, note: 'no Notion page found to delete' })
+    }
+
+    // Archive the Notion page (mark as archived) rather than permanent delete
+    try {
+      const patchUrl = `https://api.notion.com/v1/pages/${pageId}`
+      const pRes = await fetch(patchUrl, {
+        method: 'PATCH',
+        headers: {
+          'Authorization': `Bearer ${NOTION_TOKEN}`,
+          'Notion-Version': NOTION_VERSION,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ archived: true })
+      })
+      const pJson = await pRes.json()
+      if (!pRes.ok) {
+        console.error('Notion archive failed', pRes.status, pJson)
+        return res.status(502).json({ ok: false, error: 'Notion archive failed', detail: pJson })
+      }
+      console.log('Notion page archived', pageId)
+      return res.status(200).json({ ok: true, archived: pageId })
+    } catch (err) {
+      console.error('Notion archive error', err)
+      return res.status(502).json({ ok: false, error: 'Notion archive error', detail: String(err) })
+    }
   }
 
   // Query Notion database to find page with matching Fillout ID property (preferred)
@@ -93,18 +179,7 @@ export default async function handler(req: any, res: any) {
       },
       page_size: 1
     }
-  } else {
-    // fallback: match by Email property in Notion
-    queryBody = {
-      filter: {
-        property: 'Email',
-        email: {
-          equals: String(email)
-        }
-      },
-      page_size: 1
-    }
-  }
+  } 
 
   let pageId: string | null = null
   try {
