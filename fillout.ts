@@ -41,8 +41,16 @@ export default async function handler(req: any, res: any) {
     const result = await mutate(mutation)
     return res.status(200).json({ ok: true, result })
   } catch (err: any) {
-    console.error('Fillout handler error', err)
+    // Log full error for easier debugging in Vercel logs
+    const details = err?.body ?? err?.message ?? String(err)
+    console.error('Fillout handler error', { err, details })
     const status = err?.status || 500
-    return res.status(status).json({ ok: false, error: err?.body || err?.message || String(err) })
+    const messages = [] as string[]
+    if (err?.body?.message) messages.push(String(err.body.message))
+    else if (err?.body && typeof err.body === 'string') messages.push(err.body)
+    else if (err?.message) messages.push(String(err.message))
+    else messages.push(String(err))
+
+    return res.status(status).json({ ok: false, error: details, messages })
   }
 }

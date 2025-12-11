@@ -44,6 +44,13 @@ Available local endpoints (while `vercel dev` runs):
 - `POST http://localhost:3000/api/fillout`
 - `POST http://localhost:3000/api/notion-webhook`
 
+Webhook setup (what to point at which endpoint)
+- **Fillout (form submissions):** Point Fillout's webhook to `https://<your-deployment>/api/fillout` (for example `https://ainspire-sync.vercel.app/api/fillout`). Fillout should POST a JSON body that includes at minimum `submission_id` or `id` and the form fields (email, firstName, lastName, etc.).
+- **Notion (database row updates):** Point your Notion automation (or integration) to `https://<your-deployment>/api/notion-webhook` (for example `https://ainspire-sync.vercel.app/api/notion-webhook`). The handler accepts either:
+	- a simplified `fields` object: `{ "fields": { "email":"...", "firstName":"...", "lastName":"...", "filloutId":"...", ... } }` (recommended), or
+	- Notion's raw `properties` object containing the page's properties. The code maps common names (e.g. `First Name`, `Last Name`, `Email`, `Major`, `Graduation Year`, `LinkedIn`, `Github`, `Personal Website`, `Calendly`, `Career Goal`, `Fillout ID`).
+- **Sanity:** Sanity does not need to send webhooks back into this project by default. `sanity.ts` is a helper client used by the handlers to write data into your Sanity dataset. If you do want Sanity to notify this service of dataset changes, configure a Sanity webhook to POST to one of your endpoints — but there is no built-in `/api/sanity` handler in this repo. If you need a Sanity webhook receiver, I can add a small `api/sanity-webhook.ts` that validates and processes Sanity webhook payloads.
+
 Deployment to Vercel
 1. Login and link the project (one-time):
 
@@ -80,3 +87,33 @@ Troubleshooting
 Want me to:
 - add example curl payloads for quick testing, or
 - add a small `test/` script that POSTs sample payloads to the local dev server?
+ 
+Examples (curl)
+1) Fillout-style payload to Fillout endpoint:
+
+```bash
+curl -X POST "https://ainspire-sync.vercel.app/api/fillout" \
+	-H "Content-Type: application/json" \
+	-d '{"submission_id":"abc123","email":"jane.doe@example.com","firstName":"Jane","lastName":"Doe"}'
+```
+
+2) Simplified Notion `fields` payload to Notion endpoint:
+
+```bash
+curl -X POST "https://ainspire-sync.vercel.app/api/notion-webhook" \
+	-H "Content-Type: application/json" \
+	-d '{"fields":{"email":"jane.doe@example.com","firstName":"Vercel","lastName":"Test","filloutId":"abc123"}}'
+```
+
+3) Raw Notion `properties` payload (uses CSV-like column names):
+
+```bash
+curl -X POST "https://ainspire-sync.vercel.app/api/notion-webhook" \
+	-H "Content-Type: application/json" \
+	-d '{"properties":{""First Name"":{"title":[{"plain_text":"Vercel"}]},"LinkedIn":{"url":"https://build.fillout.com/editor/preview/qqRyVub4LPus"},"Email":{"email":"vg435@njit.edu"},"Fillout ID":{"rich_text":[{"plain_text":"4b9a82e5-562e-442e-b877-7ad76e418258"}]}}}'
+```
+
+Security recommendations
+- Add a shared secret header (for example `X-Webhook-Secret`) to your external webhooks and verify it inside the handlers to prevent unauthorized requests.
+- Prefer sending a stable identifier (`filloutId`) from Fillout into Notion so the Notion webhook can include it and the handlers can deterministically target the correct Sanity document.
+
