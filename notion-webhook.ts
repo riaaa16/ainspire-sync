@@ -1,5 +1,8 @@
 import { query, mutate, sanitizeId } from './sanity'
 
+const NOTION_TOKEN = process.env.NOTION_TOKEN || ''
+const NOTION_VERSION = process.env.NOTION_VERSION || '2022-06-28'
+
 function mapNotionProperties(props: any) {
   // Expect a simplified object mapping here. Notion properties shape varies, so
   // callers may prefer to send a pre-mapped `fields` object. This helper attempts
@@ -49,8 +52,40 @@ export default async function handler(req: any, res: any) {
   // Accept multiple payload shapes:
   // - { properties: { ... } } (simple)
   // - { fields: { ... } } (simplified)
-  // - { data: { properties: { ... } } } (Notion automation wrapper)
-  const properties = body.properties || body.fields || (body.data && (body.data.properties || body.data.fields)) || {}
+  // - Notion integration webhook: { entity: { id, type:'page' }, type: 'page.properties_updated' }
+  //   In that case we fetch the page from the Notion API to obtain `properties`.
+  // - { data: { properties: { ... } } } (older automation wrapper)
+
+  let properties: any = null
+
+  // Integration webhook: fetch page properties when Notion sends a page event
+  if (body && body.entity && body.entity.type === 'page' && typeof body.entity.id === 'string') {
+    if (!NOTION_TOKEN) {
+      console.warn('Received Notion integration webhook but NOTION_TOKEN not set; cannot fetch page')
+    } else {
+      try {
+        const pageId = body.entity.id
+        const pageRes = await fetch(`https://api.notion.com/v1/pages/${pageId}`, {
+          headers: {
+            Authorization: `Bearer ${NOTION_TOKEN}`,
+            'Notion-Version': NOTION_VERSION,
+            'Content-Type': 'application/json'
+          }
+        })
+        const pageJson = await pageRes.json()
+        if (!pageRes.ok) {
+          console.warn('Notion page fetch failed', pageRes.status, pageJson)
+        } else if (pageJson && pageJson.properties) {
+          properties = pageJson.properties
+        }
+      } catch (err) {
+        console.warn('Error fetching Notion page properties', err)
+      }
+    }
+  }
+
+  // Fallbacks to older/simpler payload shapes
+  if (!properties) properties = body.properties || body.fields || (body.data && (body.data.properties || body.data.fields)) || {}
   const fields = mapNotionProperties(properties)
 
   // normalize email for matching
